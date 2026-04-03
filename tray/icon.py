@@ -9,7 +9,17 @@ from typing import Optional
 
 from config.settings import settings
 from core.message_handler import message_handler
+from core.wechat_client import wechat_client
 from utils.logger import logger
+
+# 导入主程序的退出事件（延迟导入避免循环依赖）
+_EXIT_EVENT = None
+
+
+def set_exit_event(event):
+    """设置退出事件"""
+    global _EXIT_EVENT
+    _EXIT_EVENT = event
 
 
 class TrayApp:
@@ -84,6 +94,17 @@ class TrayApp:
         """退出程序"""
         logger.info("正在退出程序...")
         self._running = False
+
+        # 【关键】停止微信消息监听
+        if wechat_client.is_connected():
+            wechat_client.stop_listening()
+            logger.info("已停止微信消息监听")
+
+        # 设置退出事件，通知主程序退出
+        global _EXIT_EVENT
+        if _EXIT_EVENT:
+            _EXIT_EVENT.set()
+
         if self.icon:
             self.icon.stop()
 

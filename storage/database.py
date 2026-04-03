@@ -4,7 +4,7 @@
 import aiosqlite
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
 
@@ -17,7 +17,8 @@ class Database:
 
     def __init__(self, db_path: str = None):
         if db_path is None:
-            db_path = Path(__file__).parent.parent / "data" / "database.db"
+            # 数据库直接放在项目根目录
+            db_path = Path(__file__).parent.parent / "database.db"
         self.db_path = db_path
         self._init_sync()
 
@@ -276,6 +277,72 @@ class Database:
                 "today_messages": today_messages,
             }
 
+    async def cleanup_old_messages(self, days: int = 30, max_per_contact: int = 1000) -> dict:
+        """清理旧消息，防止数据库过大"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cutoff_date = (datetime.now() - timedelta(days=days)).isoformat()
+
+            # 删除超过天数限制的消息
+            await db.execute(
+                "DELETE FROM messages WHERE timestamp < ?",
+                (cutoff_date,)
+            )
+            old_deleted = db.total_changes
+
+            # 获取每个联系人的消息数
+            async with db.execute("""
+                SELECT contact_id, COUNT(*) as count
+                FROM messages
+                GROUP BY contact_id
+            """) as cursor:
+                contacts_over_limit = []
+                async for row in cursor:
+                    if row[1] > max_per_contact:
+                        contacts_over_limit.append((row[0], row[1]))
+
+            # 对超过单联系人限制的消息进行删除（保留最新的）
+            for contact_id, count in contacts_over_limit:
+                await db.execute("""
+                    DELETE FROM messages
+                    WHERE contact_id = ?
+                    AND id NOT IN (
+                        SELECT id FROM messages
+                        WHERE contact_id = ?
+                        ORDER BY timestamp DESC
+                        LIMIT ?
+                    )
+                """, (contact_id, contact_id, max_per_contact))
+
+            limit_deleted = db.total_changes - old_deleted
+
+            # 清理孤立的上下文（联系人已删除）
+            await db.execute("""
+                DELETE FROM conversation_context
+                WHERE contact_id NOT IN (SELECT id FROM contacts)
+            """)
+
+            await db.commit()
+
+            logger.info(f"清理完成: 删除 {old_deleted} 条旧消息, {limit_deleted} 条超限消息")
+
+            return {
+                "old_deleted": old_deleted,
+                "limit_deleted": limit_deleted,
+                "total_deleted": old_deleted + limit_deleted
+            }
+
+    async def get_db_size(self) -> dict:
+        """获取数据库大小信息"""
+        db_file = Path(self.db_path)
+        if db_file.exists():
+            size = db_file.stat().st_size
+            return {
+                "size_bytes": size,
+                "size_mb": round(size / (1024 * 1024), 2),
+                "path": str(db_file)
+            }
+        return {"size_bytes": 0, "size_mb": 0, "path": str(db_file)}
+
 
 # 全局数据库实例
 db = Database()
@@ -289,7 +356,8 @@ class DatabaseSync:
 
     def __init__(self, db_path: str = None):
         if db_path is None:
-            db_path = Path(__file__).parent.parent / "data" / "database.db"
+            # 数据库直接放在项目根目录
+            db_path = Path(__file__).parent.parent / "database.db"
         self.db_path = db_path
         # 确保表存在
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -347,6 +415,72 @@ class DatabaseSync:
                 "total_messages": total_messages,
                 "today_messages": today_messages,
             }
+
+    async def cleanup_old_messages(self, days: int = 30, max_per_contact: int = 1000) -> dict:
+        """清理旧消息，防止数据库过大"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cutoff_date = (datetime.now() - timedelta(days=days)).isoformat()
+
+            # 删除超过天数限制的消息
+            await db.execute(
+                "DELETE FROM messages WHERE timestamp < ?",
+                (cutoff_date,)
+            )
+            old_deleted = db.total_changes
+
+            # 获取每个联系人的消息数
+            async with db.execute("""
+                SELECT contact_id, COUNT(*) as count
+                FROM messages
+                GROUP BY contact_id
+            """) as cursor:
+                contacts_over_limit = []
+                async for row in cursor:
+                    if row[1] > max_per_contact:
+                        contacts_over_limit.append((row[0], row[1]))
+
+            # 对超过单联系人限制的消息进行删除（保留最新的）
+            for contact_id, count in contacts_over_limit:
+                await db.execute("""
+                    DELETE FROM messages
+                    WHERE contact_id = ?
+                    AND id NOT IN (
+                        SELECT id FROM messages
+                        WHERE contact_id = ?
+                        ORDER BY timestamp DESC
+                        LIMIT ?
+                    )
+                """, (contact_id, contact_id, max_per_contact))
+
+            limit_deleted = db.total_changes - old_deleted
+
+            # 清理孤立的上下文（联系人已删除）
+            await db.execute("""
+                DELETE FROM conversation_context
+                WHERE contact_id NOT IN (SELECT id FROM contacts)
+            """)
+
+            await db.commit()
+
+            logger.info(f"清理完成: 删除 {old_deleted} 条旧消息, {limit_deleted} 条超限消息")
+
+            return {
+                "old_deleted": old_deleted,
+                "limit_deleted": limit_deleted,
+                "total_deleted": old_deleted + limit_deleted
+            }
+
+    async def get_db_size(self) -> dict:
+        """获取数据库大小信息"""
+        db_file = Path(self.db_path)
+        if db_file.exists():
+            size = db_file.stat().st_size
+            return {
+                "size_bytes": size,
+                "size_mb": round(size / (1024 * 1024), 2),
+                "path": str(db_file)
+            }
+        return {"size_bytes": 0, "size_mb": 0, "path": str(db_file)}
 
     def get_all_contacts_sync(self, whitelist_only: bool = False) -> List[Contact]:
         """获取所有联系人"""
@@ -418,6 +552,27 @@ class DatabaseSync:
                     timestamp=datetime.fromisoformat(row["timestamp"]),
                 ))
             return list(reversed(messages))
+
+    def get_conversation_context_sync(self, contact_id: int) -> dict:
+        """获取对话上下文"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM conversation_context WHERE contact_id = ?",
+                (contact_id,)
+            ).fetchone()
+            if row:
+                return {
+                    "contact_id": row["contact_id"],
+                    "context_json": row["context_json"],
+                    "updated_at": row["updated_at"]
+                }
+            # 不存在则返回空的
+            return {
+                "contact_id": contact_id,
+                "context_json": "[]",
+                "updated_at": None
+            }
 
     def delete_contact_sync(self, contact_id: int) -> bool:
         """删除联系人"""

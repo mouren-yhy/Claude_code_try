@@ -38,9 +38,13 @@ def dashboard():
     """仪表盘 - 显示运行状态"""
     # 获取统计数据
     stats = db_sync.get_stats_sync()
+    # 获取回复模式
+    from core.message_handler import ReplyMode
+    reply_mode = settings.get("wechat.reply_mode", ReplyMode.COPY_ONLY)
     return render_template("dashboard.html",
                           stats=stats,
                           is_paused=message_handler.is_paused(),
+                          reply_mode=reply_mode,
                           ollama_connected=ai_engine.test_connection())
 
 
@@ -176,6 +180,27 @@ def api_contact_messages(contact_id):
     })
 
 
+@bp.route("/api/contacts/<int:contact_id>/context", methods=["GET"])
+def api_contact_context(contact_id):
+    """获取联系人的 AI 对话上下文"""
+    context_data = db_sync.get_conversation_context_sync(contact_id)
+    # 解析 JSON 并返回
+    try:
+        context = json.loads(context_data["context_json"])
+    except:
+        context = []
+
+    return jsonify({
+        "success": True,
+        "data": {
+            "contact_id": context_data["contact_id"],
+            "context": context,
+            "updated_at": context_data["updated_at"],
+            "message_count": len(context)
+        }
+    })
+
+
 @bp.route("/chat-history")
 def chat_history():
     """聊天历史页面"""
@@ -246,9 +271,10 @@ def api_style_upload():
 
     # 保存文件
     import os
-    upload_dir = "data/chat_history"
-    os.makedirs(upload_dir, exist_ok=True)
-    file_path = os.path.join(upload_dir, f"{contact_name}_{file.filename}")
+    from pathlib import Path
+    upload_dir = Path(__file__).parent.parent.parent / "chat_history"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    file_path = upload_dir / f"{contact_name}_{file.filename}"
 
     file.save(file_path)
 
@@ -289,10 +315,78 @@ def api_control_resume():
 @bp.route("/api/control/status", methods=["GET"])
 def api_control_status():
     """获取控制状态"""
+    from core.message_handler import ReplyMode
+    reply_mode = settings.get("wechat.reply_mode", ReplyMode.COPY_ONLY)
     return jsonify({
         "success": True,
         "data": {
             "paused": message_handler.is_paused(),
+            "reply_mode": reply_mode,
             "ollama_connected": ai_engine.test_connection()
         }
+    })
+
+
+@bp.route("/api/control/reply-mode", methods=["PUT"])
+def api_control_reply_mode():
+    """设置回复模式"""
+    from core.message_handler import ReplyMode
+    data = request.json
+    mode = data.get("mode", ReplyMode.COPY_PASTE)
+
+    valid_modes = [ReplyMode.AUTO_SEND, ReplyMode.COPY_ONLY,
+                   ReplyMode.COPY_PASTE, ReplyMode.AUTO_PASTE]
+    if mode not in valid_modes:
+        return jsonify({"success": False, "error": "无效的回复模式"}), 400
+
+    settings.update({"wechat.reply_mode": mode})
+    logger.info(f"回复模式已更改为: {mode}")
+
+    return jsonify({
+        "success": True,
+        "data": {"mode": mode}
+    })
+
+
+@bp.route("/api/storage/info", methods=["GET"])
+def api_storage_info():
+    """获取存储信息"""
+    import asyncio
+    size_info = asyncio.run(db.get_db_size())
+
+    # 获取配置的限制
+    max_db_size = settings.get("storage.max_db_size", 100 * 1024 * 1024)
+    max_messages = settings.get("storage.max_messages_per_contact", 1000)
+    cleanup_days = settings.get("storage.cleanup_days", 30)
+
+    return jsonify({
+        "success": True,
+        "data": {
+            "db_size": size_info,
+            "limits": {
+                "max_db_size_mb": round(max_db_size / (1024 * 1024), 2),
+                "max_messages_per_contact": max_messages,
+                "cleanup_days": cleanup_days
+            },
+            "usage_percent": round(size_info["size_mb"] / (max_db_size / (1024 * 1024)) * 100, 2)
+        }
+    })
+
+
+@bp.route("/api/storage/cleanup", methods=["POST"])
+def api_storage_cleanup():
+    """手动清理存储"""
+    import asyncio
+    data = request.json or {}
+    days = data.get("days", settings.get("storage.cleanup_days", 30))
+    max_per_contact = data.get("max_per_contact", settings.get("storage.max_messages_per_contact", 1000))
+
+    result = asyncio.run(db.cleanup_old_messages(
+        days=days,
+        max_per_contact=max_per_contact
+    ))
+
+    return jsonify({
+        "success": True,
+        "data": result
     })

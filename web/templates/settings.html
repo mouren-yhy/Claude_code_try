@@ -137,6 +137,40 @@
         </div>
     </div>
 
+    <!-- 存储管理 -->
+    <div class="col-md-6">
+        <div class="card h-100">
+            <div class="card-header bg-transparent">
+                <h5 class="mb-0"><i class="bi bi-database"></i> 存储管理</h5>
+            </div>
+            <div class="card-body">
+                <div id="storageInfo">
+                    <div class="d-flex justify-content-between mb-2">
+                        <span>数据库大小:</span>
+                        <span id="dbSize">加载中...</span>
+                    </div>
+                    <div class="progress mb-3" style="height: 10px;">
+                        <div id="storageBar" class="progress-bar" role="progressbar" style="width: 0%"></div>
+                    </div>
+                    <div class="small text-muted mb-3">
+                        <div>限制: <span id="maxDbSize">-</span> MB</div>
+                        <div>每联系人最多: <span id="maxMessages">-</span> 条消息</div>
+                        <div>自动清理: <span id="cleanupDays">-</span> 天前的消息</div>
+                    </div>
+                </div>
+                <hr>
+                <div class="d-grid">
+                    <button class="btn btn-outline-warning" onclick="cleanupStorage()">
+                        <i class="bi bi-trash"></i> 清理旧数据
+                    </button>
+                </div>
+                <p class="text-muted mt-2 small mb-0">
+                    清理将删除超过设定天数和超出限制的消息
+                </p>
+            </div>
+        </div>
+    </div>
+
     <!-- 测试 AI -->
     <div class="col-12">
         <div class="card">
@@ -293,5 +327,54 @@ async function loadModels() {
 }
 
 loadModels();
+
+// 存储管理
+async function loadStorageInfo() {
+    try {
+        const res = await fetch('/api/storage/info');
+        const result = await res.json();
+        if (result.success) {
+            const data = result.data;
+            document.getElementById('dbSize').textContent = data.db_size.size_mb + ' MB';
+            document.getElementById('maxDbSize').textContent = data.limits.max_db_size_mb;
+            document.getElementById('maxMessages').textContent = data.limits.max_messages_per_contact;
+            document.getElementById('cleanupDays').textContent = data.limits.cleanup_days;
+
+            const bar = document.getElementById('storageBar');
+            bar.style.width = Math.min(data.usage_percent, 100) + '%';
+            bar.className = 'progress-bar ' + (
+                data.usage_percent > 80 ? 'bg-danger' :
+                data.usage_percent > 50 ? 'bg-warning' : 'bg-success'
+            );
+        }
+    } catch (e) {
+        console.error('加载存储信息失败', e);
+    }
+}
+
+async function cleanupStorage() {
+    if (!confirm('确定要清理旧数据吗？这将删除超过设定天数的消息和超出限制的消息。')) {
+        return;
+    }
+
+    try {
+        const res = await fetch('/api/storage/cleanup', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({})
+        });
+        const result = await res.json();
+        if (result.success) {
+            alert('清理完成！删除了 ' + result.data.total_deleted + ' 条消息');
+            loadStorageInfo();
+        } else {
+            alert('清理失败: ' + result.error);
+        }
+    } catch (e) {
+        alert('操作失败: ' + e);
+    }
+}
+
+loadStorageInfo();
 </script>
 {% endblock %}

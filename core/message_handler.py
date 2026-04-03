@@ -1,8 +1,13 @@
 """
 消息处理器 - 处理消息接收、AI 回复、上下文管理
+
+回复模式:
+- auto_send: 自动发送消息
+- copy_only: 仅复制到剪贴板，由用户手动粘贴
 """
 import asyncio
 import json
+import pyperclip
 from typing import Optional, List, Dict
 from datetime import datetime
 
@@ -13,6 +18,14 @@ from core.personality import style_learning
 from storage.database import db
 from storage.models import Contact, Message, MessageType as MsgType
 from utils.logger import logger
+
+
+class ReplyMode:
+    """回复模式"""
+    AUTO_SEND = "auto_send"    # 自动发送（搜索联系人+粘贴+回车）
+    COPY_ONLY = "copy_only"    # 仅复制到剪贴板（手动操作）
+    COPY_PASTE = "copy_paste"  # 复制+自动粘贴（等待用户按回车发送）
+    AUTO_PASTE = "auto_paste"  # 复制+自动粘贴+自动发送
 
 
 class MessageHandler:
@@ -42,8 +55,12 @@ class MessageHandler:
         self._processing.add(contact_name)
 
         try:
-            # 检查是否启用自动回复
-            if not settings.get("wechat.auto_reply", True):
+            # 检查是否启用回复（仅复制或自动发送）
+            auto_reply = settings.get("wechat.auto_reply", False)
+            reply_mode = settings.get("wechat.reply_mode", ReplyMode.COPY_ONLY)
+
+            # 如果完全禁用且不是仅复制模式，则跳过
+            if not auto_reply and reply_mode != ReplyMode.COPY_ONLY:
                 logger.debug("自动回复已禁用")
                 return
 
@@ -136,9 +153,95 @@ class MessageHandler:
             return None
 
     def _send_reply(self, contact_name: str, content: str) -> bool:
-        """发送回复"""
+        """
+        发送回复
+
+        根据 reply_mode 配置决定行为:
+        - auto_send: 搜索联系人+粘贴+回车（完全自动）
+        - copy_only: 仅复制到剪贴板
+        - copy_paste: 复制+自动粘贴（用户按回车发送）
+        - auto_paste: 复制+自动粘贴+自动回车
+        """
         try:
-            return wechat_client.send_message(contact_name, content)
+            reply_mode = settings.get("wechat.reply_mode", ReplyMode.COPY_PASTE)
+
+            if reply_mode == ReplyMode.COPY_ONLY:
+                # 仅复制模式
+                pyperclip.copy(content)
+                logger.info(f"[仅复制] 已复制到剪贴板")
+                logger.info(f"  联系人: {contact_name}")
+                return True
+
+            elif reply_mode == ReplyMode.COPY_PASTE:
+                # 复制+自动粘贴模式
+                import pyautogui
+                import win32gui
+                import win32con
+                import time
+                pyperclip.copy(content)
+                time.sleep(0.1)
+
+                # 只有当微信是前台窗口时才自动粘贴
+                foreground_wnd = win32gui.GetForegroundWindow()
+                if foreground_wnd == wechat_client.wx_hwnd:
+                    # 微信在前台，可以安全粘贴
+                    try:
+                        # 点击输入框区域（微信窗口内部）
+                        if wechat_client.wx_rect:
+                            left, top, right, bottom = wechat_client.wx_rect
+                            input_x = int((left + right) / 2)
+                            input_y = int(bottom - 50)
+                            pyautogui.click(input_x, input_y)
+                            time.sleep(0.1)
+                        pyautogui.hotkey('ctrl', 'v')
+                        logger.info(f"[自动粘贴] 已粘贴 AI 回复")
+                        logger.info(f"  联系人: {contact_name}")
+                    except Exception as e:
+                        logger.warning(f"自动粘贴失败: {e}")
+                else:
+                    # 微信不在前台，只复制
+                    logger.info(f"[仅复制] 微信不在前台，仅复制到剪贴板")
+
+                logger.info(f"  联系人: {contact_name}")
+                logger.info(f"  内容: {content[:50]}...")
+                return True
+
+            elif reply_mode == ReplyMode.AUTO_PASTE:
+                # 复制+自动粘贴+自动回车
+                import pyautogui
+                import win32gui
+                import win32con
+                import time
+                pyperclip.copy(content)
+                time.sleep(0.1)
+
+                # 只有当微信是前台窗口时才自动操作
+                foreground_wnd = win32gui.GetForegroundWindow()
+                if foreground_wnd == wechat_client.wx_hwnd:
+                    try:
+                        if wechat_client.wx_rect:
+                            left, top, right, bottom = wechat_client.wx_rect
+                            input_x = int((left + right) / 2)
+                            input_y = int(bottom - 50)
+                            pyautogui.click(input_x, input_y)
+                            time.sleep(0.1)
+                        pyautogui.hotkey('ctrl', 'v')
+                        time.sleep(0.2)
+                        pyautogui.press('enter')
+                        logger.info(f"[自动粘贴+发送] 已发送 AI 回复")
+                    except Exception as e:
+                        logger.warning(f"自动发送失败: {e}")
+                else:
+                    logger.info(f"[仅复制] 微信不在前台，仅复制到剪贴板")
+
+                logger.info(f"  联系人: {contact_name}")
+                logger.info(f"  内容: {content[:50]}...")
+                return True
+
+            else:  # AUTO_SEND
+                # 完全自动发送模式
+                return wechat_client.send_message(contact_name, content)
+
         except Exception as e:
             logger.error(f"发送回复异常: {e}")
             return False
@@ -174,11 +277,15 @@ class MessageHandler:
     def pause(self):
         """暂停自动回复"""
         self._paused = True
+        # 同步暂停微信客户端的消息监听
+        wechat_client.pause()
         logger.info("自动回复已暂停")
 
     def resume(self):
         """恢复自动回复"""
         self._paused = False
+        # 同步恢复微信客户端的消息监听
+        wechat_client.resume()
         logger.info("自动回复已恢复")
 
     def is_paused(self) -> bool:

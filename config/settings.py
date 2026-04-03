@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR = PROJECT_ROOT  # 数据直接存在项目根目录
 CONFIG_FILE = PROJECT_ROOT / "config" / "settings.json"
 DEFAULT_CONFIG_FILE = PROJECT_ROOT / "config" / "settings.default.json"
 
@@ -64,6 +64,13 @@ class Settings:
             "style_learning": {
                 "enabled": True,
                 "sample_messages": 50  # 从聊天记录中提取的样本数量
+            },
+            "storage": {
+                "max_db_size": 100 * 1024 * 1024,  # 数据库最大 100MB
+                "max_messages_per_contact": 1000,  # 每个联系人最多保存 1000 条消息
+                "max_context_tokens": 4000,  # AI 上下文最大 token 数估算
+                "auto_cleanup": True,  # 自动清理旧数据
+                "cleanup_days": 30  # 清理 30 天前的消息
             }
         }
 

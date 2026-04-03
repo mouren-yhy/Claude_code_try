@@ -5,10 +5,16 @@
 使用本地 AI 模型自动回复微信私聊消息
 """
 import asyncio
+import os
 import sys
 import threading
 import time
 from pathlib import Path
+from threading import Event
+
+# 禁用 PaddlePaddle oneDNN（解决兼容性问题）
+os.environ['FLAGS_use_mkldnn'] = '0'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
 
 # 添加项目根目录到 Python 路径
 PROJECT_ROOT = Path(__file__).parent
@@ -19,19 +25,41 @@ from core.wechat_client import wechat_client
 from core.message_handler import message_handler
 from core.ai_engine import ai_engine
 from storage.database import db
-from tray.icon import tray_app
+from storage.database import db_sync
+from storage.models import Contact
+from tray.icon import tray_app, set_exit_event
 from utils.logger import logger
 from web.app import flask_app
+
+
+# 全局退出事件
+EXIT_EVENT = Event()
 
 
 def check_dependencies():
     """检查依赖是否安装"""
     missing = []
 
+    # 检查核心依赖
     try:
-        import wxauto
+        import pyautogui
     except ImportError:
-        missing.append("wxauto")
+        missing.append("pyautogui")
+
+    try:
+        import pyperclip
+    except ImportError:
+        missing.append("pyperclip")
+
+    try:
+        import cv2
+    except ImportError:
+        missing.append("opencv-python")
+
+    try:
+        from paddleocr import PaddleOCR
+    except ImportError:
+        missing.append("paddleocr")
 
     try:
         import flask
@@ -47,6 +75,11 @@ def check_dependencies():
         import pystray
     except ImportError:
         missing.append("pystray")
+
+    try:
+        import win32gui
+    except ImportError:
+        missing.append("pywin32")
 
     if missing:
         logger.error("缺少必要的依赖，请运行: pip install -r requirements.txt")
@@ -105,8 +138,23 @@ def main(test_mode=False):
         logger.warning("Ollama 服务未连接，请确保已运行: ollama serve")
         logger.warning("程序将继续启动，但 AI 回复功能可能不可用")
 
+    # 检查并清理旧数据
+    if settings.get("storage.auto_cleanup", True):
+        logger.info("检查数据存储...")
+        import asyncio
+        try:
+            result = asyncio.run(db.cleanup_old_messages(
+                days=settings.get("storage.cleanup_days", 30),
+                max_per_contact=settings.get("storage.max_messages_per_contact", 1000)
+            ))
+            if result["total_deleted"] > 0:
+                logger.info(f"已清理 {result['total_deleted']} 条旧消息")
+        except Exception as e:
+            logger.warning(f"数据清理失败: {e}")
+
     # 启动托盘应用
     logger.info("启动系统托盘...")
+    set_exit_event(EXIT_EVENT)  # 设置退出事件
     tray_app.start()
 
     # 连接微信
@@ -117,9 +165,21 @@ def main(test_mode=False):
             wechat_connected = True
             # 添加消息监听回调
             wechat_client.add_message_callback(on_message_received)
+
+            # 从数据库获取白名单联系人
+            whitelist_contacts = db_sync.get_all_contacts_sync(whitelist_only=True)
+            contact_names = [c.name for c in whitelist_contacts if c.name]
+
+            if contact_names:
+                logger.info(f"从数据库读取到 {len(contact_names)} 个白名单联系人")
+                for c in contact_names:
+                    logger.info(f"  - {c}")
+            else:
+                logger.warning("数据库中没有白名单联系人，请在 Web 管理后台添加")
+
             # 开始监听微信消息
             logger.info("开始监听微信消息...")
-            wechat_client.start_listening()
+            wechat_client.start_listening(contacts=contact_names if contact_names else None)
         else:
             logger.warning("微信连接失败，将仅启用 Web 管理后台和 AI 测试功能")
     else:
@@ -145,8 +205,8 @@ def main(test_mode=False):
 
     # 保持主线程运行
     try:
-        while True:
-            time.sleep(1)
+        while not EXIT_EVENT.is_set():
+            time.sleep(0.5)
     except KeyboardInterrupt:
         logger.info("收到退出信号...")
     finally:

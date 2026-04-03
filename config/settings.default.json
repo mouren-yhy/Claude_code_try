@@ -16,7 +16,13 @@
   },
   "wechat": {
     "auto_reply": true,
-    "whitelist_only": true
+    "whitelist_only": true,
+    "poll_interval": 3,
+    "detection_mode": "hybrid"
+  },
+  "detector": {
+    "diff_threshold": 30,
+    "change_ratio": 0.02
   },
   "logging": {
     "level": "INFO",
