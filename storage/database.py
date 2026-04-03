@@ -400,20 +400,26 @@ class DatabaseSync:
         conn.commit()
 
     def get_stats_sync(self) -> dict:
-        """获取统计信息"""
+        """
+        获取统计信息（优化版 - 单次查询）
+
+        将4个独立的COUNT查询合并为1个查询，减少数据库往返
+        """
         with sqlite3.connect(self.db_path) as conn:
-            total_contacts = conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
-            whitelist_contacts = conn.execute("SELECT COUNT(*) FROM contacts WHERE is_whitelist = 1").fetchone()[0]
-            total_messages = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-            today_messages = conn.execute("""
-                SELECT COUNT(*) FROM messages
-                WHERE DATE(timestamp) = DATE('now')
-            """).fetchone()[0]
+            # 使用子查询一次性获取所有统计
+            row = conn.execute("""
+                SELECT
+                    (SELECT COUNT(*) FROM contacts) as total_contacts,
+                    (SELECT COUNT(*) FROM contacts WHERE is_whitelist = 1) as whitelist_contacts,
+                    (SELECT COUNT(*) FROM messages) as total_messages,
+                    (SELECT COUNT(*) FROM messages WHERE DATE(timestamp) = DATE('now')) as today_messages
+            """).fetchone()
+
             return {
-                "total_contacts": total_contacts,
-                "whitelist_contacts": whitelist_contacts,
-                "total_messages": total_messages,
-                "today_messages": today_messages,
+                "total_contacts": row[0],
+                "whitelist_contacts": row[1],
+                "total_messages": row[2],
+                "today_messages": row[3],
             }
 
     async def cleanup_old_messages(self, days: int = 30, max_per_contact: int = 1000) -> dict:
@@ -481,6 +487,27 @@ class DatabaseSync:
                 "path": str(db_file)
             }
         return {"size_bytes": 0, "size_mb": 0, "path": str(db_file)}
+
+    def get_contact_by_id_sync(self, contact_id: int) -> Optional[Contact]:
+        """根据 ID 获取单个联系人（修复 N+1 查询问题）"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM contacts WHERE id = ?", (contact_id,)
+            ).fetchone()
+            if row:
+                return Contact(
+                    id=row["id"],
+                    wx_id=row["wx_id"],
+                    name=row["name"],
+                    remark=row["remark"],
+                    is_whitelist=bool(row["is_whitelist"]),
+                    system_prompt=row["system_prompt"],
+                    style_profile=row["style_profile"],
+                    created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
+                    updated_at=datetime.fromisoformat(row["updated_at"]) if row["updated_at"] else None,
+                )
+        return None
 
     def get_all_contacts_sync(self, whitelist_only: bool = False) -> List[Contact]:
         """获取所有联系人"""

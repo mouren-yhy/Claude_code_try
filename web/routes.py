@@ -3,7 +3,6 @@ Flask 路由定义
 """
 from flask import Blueprint, render_template, jsonify, request, redirect, url_for, flash
 import json
-import asyncio
 from datetime import datetime
 
 from config.settings import settings
@@ -13,18 +12,10 @@ from core.personality import style_learning
 from storage.database import db, db_sync
 from storage.models import Contact
 from utils.logger import logger
+from utils.async_helper import run_async  # 使用复用事件循环的版本
+from utils.error_handler import handle_api_error
 
 bp = Blueprint("main", __name__)
-
-
-def run_async(coro):
-    """运行异步函数"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
 
 
 @bp.route("/")
@@ -79,8 +70,7 @@ def api_contacts():
 @bp.route("/api/contacts/<int:contact_id>", methods=["GET"])
 def api_contact_get(contact_id):
     """获取单个联系人"""
-    contacts_list = db_sync.get_all_contacts_sync()
-    contact = next((c for c in contacts_list if c.id == contact_id), None)
+    contact = db_sync.get_contact_by_id_sync(contact_id)
     if contact:
         return jsonify({
             "success": True,
@@ -90,6 +80,7 @@ def api_contact_get(contact_id):
 
 
 @bp.route("/api/contacts", methods=["POST"])
+@handle_api_error
 def api_contact_create():
     """创建联系人"""
     data = request.json
@@ -108,11 +99,11 @@ def api_contact_create():
 
 
 @bp.route("/api/contacts/<int:contact_id>", methods=["PUT"])
+@handle_api_error
 def api_contact_update(contact_id):
     """更新联系人"""
     data = request.json
-    contacts_list = db_sync.get_all_contacts_sync()
-    existing = next((c for c in contacts_list if c.id == contact_id), None)
+    existing = db_sync.get_contact_by_id_sync(contact_id)
 
     if existing:
         contact = Contact(
@@ -134,6 +125,7 @@ def api_contact_update(contact_id):
 
 
 @bp.route("/api/contacts/<int:contact_id>", methods=["DELETE"])
+@handle_api_error
 def api_contact_delete(contact_id):
     """删除联系人"""
     success = db_sync.delete_contact_sync(contact_id)
@@ -143,12 +135,12 @@ def api_contact_delete(contact_id):
 
 
 @bp.route("/api/contacts/<int:contact_id>/whitelist", methods=["PUT"])
+@handle_api_error
 def api_contact_whitelist(contact_id):
     """设置白名单"""
     data = request.json
     is_whitelist = data.get("is_whitelist", False)
-    contacts_list = db_sync.get_all_contacts_sync()
-    contact = next((c for c in contacts_list if c.id == contact_id), None)
+    contact = db_sync.get_contact_by_id_sync(contact_id)
 
     if contact:
         contact.is_whitelist = is_whitelist
@@ -247,6 +239,7 @@ def api_ai_models():
 
 
 @bp.route("/api/ai/test", methods=["POST"])
+@handle_api_error
 def api_ai_test():
     """测试 AI 连接"""
     test_message = request.json.get("message", "你好")
@@ -258,6 +251,7 @@ def api_ai_test():
 
 
 @bp.route("/api/style/upload", methods=["POST"])
+@handle_api_error
 def api_style_upload():
     """上传聊天记录学习风格"""
     if "file" not in request.files:

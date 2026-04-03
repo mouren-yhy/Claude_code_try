@@ -37,3 +37,12 @@ desktop.ini
 .pytest_cache/
 .coverage
 htmlcov/
+
+# 训练数据和模型
+data/dataset/
+data/models/
+runs/
+training/
+*.pt
+*.pth
+*.onnx

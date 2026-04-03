@@ -1,10 +1,12 @@
 """
-微信客户端模块 - 使用坐标模板 + OCR 混合方案
+微信客户端模块 - 使用坐标模板 + OCR + YOLO 混合方案
 
 优化方案：
 1. 主使用坐标模板检测新消息（快速、低开销）
 2. OCR 仅用于提取消息内容（按需调用）
-3. 支持微信、钉钉等多种应用
+3. 支持 YOLO 目标检测进行新消息识别（可选）
+4. 二次验证：联系人名 + 聊天标题双重验证
+5. 支持微信、钉钉等多种应用
 """
 import time
 import win32gui
@@ -30,6 +32,24 @@ except ImportError:
 from config.settings import settings
 from core.template_detector import template_detector, get_template
 from utils.logger import logger
+
+# YOLO 检测器 - 延迟导入
+try:
+    from core.yolo_detector import YoloDetector, create_detector
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
+    YoloDetector = None
+    create_detector = None
+
+# 用户名验证器
+try:
+    from core.username_validator import UsernameValidator, WhitelistConfig
+    VALIDATOR_AVAILABLE = True
+except ImportError:
+    VALIDATOR_AVAILABLE = False
+    UsernameValidator = None
+    WhitelistConfig = None
 
 
 # 禁用 pyautogui 的安全检查（需要用户确认）
@@ -76,13 +96,31 @@ class WeChatClient:
         # 轮询间隔（秒）
         self._poll_interval = settings.get("wechat.poll_interval", 3)
 
-        # 检测模式：template（模板优先）/ ocr_only（纯OCR）/ hybrid（混合）
+        # 检测模式：template（模板优先）/ ocr_only（纯OCR）/ hybrid（混合）/ yolo（YOLO检测）
         self._detection_mode = settings.get("wechat.detection_mode", "hybrid")
+
+        # YOLO 相关配置
+        self._yolo_enabled = settings.get("wechat.yolo_enabled", False)
+        self._yolo_detector: Optional[YoloDetector] = None
+        self._dual_validation = settings.get("wechat.dual_validation", True)
+        self._multi_user_support = settings.get("wechat.multi_user_support", True)
+
+        # 用户名验证器（二次验证）
+        self._username_validator: Optional[UsernameValidator] = None
+        self._pending_contacts: Dict[str, dict] = {}  # 待验证的联系人 {contact_name: {'dot': Detection, 'contact_item': Detection}}
 
         # 使用全局模板检测器
         self._detector = template_detector
 
-        logger.info(f"WeChatClient 初始化完成（检测模式: {self._detection_mode}）")
+        # 初始化验证器
+        if VALIDATOR_AVAILABLE and self._dual_validation:
+            self._init_validator()
+
+        # 初始化 YOLO 检测器（如果启用）
+        if self._yolo_enabled and YOLO_AVAILABLE:
+            self._init_yolo()
+
+        logger.info(f"WeChatClient 初始化完成（检测模式: {self._detection_mode}, YOLO: {self._yolo_enabled}, 二次验证: {self._dual_validation}）")
 
     def _init_ocr(self):
         """初始化 OCR 引擎"""
@@ -104,6 +142,55 @@ class WeChatClient:
         except Exception as e:
             logger.error(f"PaddleOCR 初始化失败: {e}")
             return None
+
+    def _init_validator(self):
+        """初始化用户名验证器"""
+        if not VALIDATOR_AVAILABLE:
+            logger.warning("UsernameValidator 不可用，二次验证功能将被禁用")
+            self._dual_validation = False
+            return
+
+        try:
+            # 从白名单联系人创建验证器
+            config = WhitelistConfig(users=self._whitelist_contacts, match_mode="exact")
+            self._username_validator = UsernameValidator(config)
+            logger.info("UsernameValidator 初始化成功")
+        except Exception as e:
+            logger.error(f"UsernameValidator 初始化失败: {e}")
+            self._dual_validation = False
+
+    def _init_yolo(self):
+        """初始化 YOLO 检测器"""
+        if not YOLO_AVAILABLE:
+            logger.warning("YOLO 不可用，将使用模板检测")
+            self._yolo_enabled = False
+            return
+
+        try:
+            model_path = settings.get("yolo.model_path", "data/models/wechat_yolov8s.pt")
+            confidence = settings.get("yolo.confidence", 0.5)
+            iou_threshold = settings.get("yolo.iou_threshold", 0.45)
+            use_gpu = settings.get("yolo.use_gpu", True)
+            device = settings.get("yolo.device", "auto")
+
+            # 检查模型文件是否存在
+            from pathlib import Path
+            if not Path(model_path).exists():
+                logger.warning(f"YOLO 模型文件不存在: {model_path}，将使用模板检测")
+                self._yolo_enabled = False
+                return
+
+            self._yolo_detector = YoloDetector(
+                model_path=model_path,
+                confidence=confidence,
+                iou_threshold=iou_threshold,
+                use_gpu=use_gpu if device == "auto" else (device != "cpu"),
+                device=None if device == "auto" else device
+            )
+            logger.info(f"YOLO 检测器初始化成功: {model_path}")
+        except Exception as e:
+            logger.error(f"YOLO 检测器初始化失败: {e}")
+            self._yolo_enabled = False
 
     def connect(self) -> bool:
         """连接微信 - 查找微信窗口"""
@@ -370,6 +457,11 @@ class WeChatClient:
                 self._whitelist_contacts = contacts
                 logger.info(f"准备监听 {len(contacts)} 个白名单联系人: {contacts}")
 
+            # 更新验证器的白名单
+            if self._dual_validation and self._username_validator and contacts:
+                self._username_validator.update_whitelist(WhitelistConfig(users=contacts))
+                logger.info(f"验证器白名单已更新，共 {len(contacts)} 个用户")
+
             # 初始化 OCR
             self._init_ocr()
             if self._ocr_engine is None:
@@ -408,7 +500,10 @@ class WeChatClient:
                     continue
 
                 # 根据检测模式选择检测方式
-                if self._detection_mode == "ocr_only":
+                if self._yolo_enabled and self._yolo_detector:
+                    # YOLO 检测模式
+                    self._poll_with_yolo(screenshot)
+                elif self._detection_mode == "ocr_only":
                     # 纯 OCR 模式（原方案，作为备用）
                     self._poll_with_ocr(screenshot)
                 else:
@@ -481,6 +576,154 @@ class WeChatClient:
 
         except Exception as e:
             logger.error(f"模板检测失败: {e}")
+
+    def _poll_with_yolo(self, screenshot: np.ndarray):
+        """使用 YOLO 检测新消息（支持多用户和二次验证）"""
+        try:
+            if not self._yolo_detector:
+                return
+
+            # 确保 OCR 已初始化
+            ocr = self._init_ocr()
+            if ocr is None:
+                logger.debug("OCR 未初始化，跳过检测")
+                return
+
+            # 1. 检测红点和联系人项
+            red_dots = self._yolo_detector.detect_red_dots(screenshot)
+            contact_items = self._yolo_detector.detect_contact_items(screenshot)
+
+            if not red_dots:
+                # 没有红点，没有新消息
+                return
+
+            # 2. 关联红点到联系人
+            max_distance = settings.get("yolo.red_dot_max_distance", 100)
+            contacts_with_dots = self._yolo_detector.match_dots_to_contacts(
+                dots=red_dots,
+                contacts=contact_items,
+                max_distance=max_distance,
+                direction="right"
+            )
+
+            if not contacts_with_dots:
+                # 红点没有关联到联系人
+                return
+
+            logger.debug(f"检测到 {len(contacts_with_dots)} 个带红点的联系人")
+
+            # 3. 处理每个带红点的联系人
+            for item in contacts_with_dots:
+                contact_detection = item["contact"]
+                dot_detection = item["dot"]
+
+                # 裁剪联系人区域并 OCR 识别
+                contact_crop = self._yolo_detector.crop_detection(screenshot, contact_detection, padding=10)
+
+                if contact_crop.size == 0:
+                    continue
+
+                # OCR 识别联系人名
+                contact_texts = self._ocr_image(contact_crop)
+                if not contact_texts:
+                    continue
+
+                # 获取第一行作为联系人名
+                detected_name = contact_texts[0].strip()
+
+                # 4. 第一次验证：联系人名白名单检查
+                if self._dual_validation and self._username_validator:
+                    validation_result = self._username_validator.validate_contact_name(detected_name)
+                    if not validation_result.is_valid:
+                        # 不在白名单，跳过
+                        logger.debug(f"联系人 {detected_name} 未通过白名单验证")
+                        continue
+
+                # 5. 点击联系人进入聊天
+                contact_center = contact_detection.center
+                pyautogui.click(int(contact_center[0]), int(contact_center[1]))
+                time.sleep(0.5)  # 等待聊天窗口加载
+
+                # 6. 获取聊天标题进行二次验证
+                chat_title_valid = True
+                if self._dual_validation and self._username_validator:
+                    # 检测聊天标题
+                    chat_title_detection = self._yolo_detector.detect_chat_title(screenshot)
+                    if chat_title_detection:
+                        title_crop = self._yolo_detector.crop_detection(screenshot, chat_title_detection, padding=10)
+                        if title_crop.size > 0:
+                            title_texts = self._ocr_image(title_crop)
+                            if title_texts:
+                                chat_title = title_texts[0].strip()
+                                title_validation = self._username_validator.validate_chat_title(chat_title)
+                                if not title_validation.is_valid:
+                                    chat_title_valid = False
+                                    logger.warning(f"聊天标题二次验证失败: {chat_title}")
+
+                if not chat_title_valid:
+                    # 二次验证失败，跳过
+                    continue
+
+                # 7. 获取消息内容
+                content = self._get_yolo_message_content(screenshot, detected_name)
+
+                if content:
+                    # 检查是否是新消息
+                    msg_key = f"{detected_name}:{content}"
+                    last_msg_key = self._last_messages.get(detected_name)
+
+                    if msg_key != last_msg_key:
+                        self._last_messages[detected_name] = msg_key
+
+                        # 触发回调
+                        message_data = {
+                            "contact_name": detected_name,
+                            "content": content,
+                            "type": MessageType.TEXT,
+                            "sender": detected_name,
+                            "time": "",
+                            "method": "yolo"
+                        }
+
+                        logger.info(f"[YOLO检测] 收到来自 {detected_name} 的新消息: {content[:50]}...")
+
+                        for callback in self._message_callbacks:
+                            try:
+                                callback(message_data)
+                            except Exception as e:
+                                logger.error(f"消息回调异常: {e}")
+
+        except Exception as e:
+            logger.error(f"YOLO 检测失败: {e}")
+
+    def _get_yolo_message_content(self, screenshot: np.ndarray, contact_name: str) -> Optional[str]:
+        """使用 YOLO 检测结果获取消息内容"""
+        try:
+            # 检测消息气泡
+            bubbles = self._yolo_detector.detect_bubbles(screenshot)
+            other_bubbles = bubbles.get("other", [])
+
+            if not other_bubbles:
+                # 没有检测到对方消息，使用差分方法
+                return self._get_message_content(contact_name, screenshot)
+
+            # 获取最后一个对方消息气泡
+            last_bubble = self._yolo_detector.sort_by_position(other_bubbles, by="y")[-1]
+            bubble_crop = self._yolo_detector.crop_detection(screenshot, last_bubble, padding=5)
+
+            if bubble_crop.size == 0:
+                return None
+
+            # OCR 识别消息内容
+            texts = self._ocr_image(bubble_crop)
+            if texts:
+                return " ".join(texts).strip()
+
+            return None
+
+        except Exception as e:
+            logger.error(f"获取 YOLO 消息内容失败: {e}")
+            return None
 
     def _poll_with_ocr(self, screenshot: np.ndarray):
         """使用纯 OCR 检测新消息（备用模式）"""
@@ -826,6 +1069,59 @@ class WeChatClient:
         self.wx_hwnd = None
         self.wx_rect = None
         return self.connect()
+
+    def update_whitelist(self, contacts: List[str]):
+        """更新白名单联系人"""
+        self._whitelist_contacts = contacts
+        logger.info(f"白名单已更新，共 {len(contacts)} 个用户")
+
+        # 同步更新验证器
+        if self._dual_validation and self._username_validator:
+            self._username_validator.update_whitelist(WhitelistConfig(users=contacts))
+            logger.info("验证器白名单已同步更新")
+
+    def enable_yolo(self, enabled: bool = True):
+        """启用或禁用 YOLO 检测"""
+        if enabled and not self._yolo_enabled:
+            # 首次启用 YOLO
+            if not self._yolo_detector and YOLO_AVAILABLE:
+                self._init_yolo()
+            self._yolo_enabled = bool(self._yolo_detector)
+            logger.info(f"YOLO 检测已{'启用' if self._yolo_enabled else '启用失败'}")
+        elif not enabled:
+            self._yolo_enabled = False
+            logger.info("YOLO 检测已禁用")
+
+    def is_yolo_enabled(self) -> bool:
+        """检查 YOLO 检测是否启用"""
+        return self._yolo_enabled and self._yolo_detector is not None
+
+    def enable_dual_validation(self, enabled: bool = True):
+        """启用或禁用二次验证"""
+        self._dual_validation = enabled
+        if enabled and not self._username_validator and VALIDATOR_AVAILABLE:
+            self._init_validator()
+        logger.info(f"二次验证已{'启用' if enabled else '禁用'}")
+
+    def get_detector_stats(self) -> Dict:
+        """获取检测器统计信息"""
+        stats = {
+            "detection_mode": self._detection_mode,
+            "yolo_enabled": self._yolo_enabled,
+            "yolo_available": YOLO_AVAILABLE,
+            "dual_validation": self._dual_validation,
+            "whitelist_count": len(self._whitelist_contacts)
+        }
+
+        if self._yolo_detector:
+            yolo_stats = self._yolo_detector.get_gpu_memory_stats()
+            stats["yolo_gpu"] = {
+                "allocated_gb": yolo_stats.allocated_gb,
+                "utilization_percent": yolo_stats.utilization_percent,
+                "detection_count": self._yolo_detector.get_detection_count()
+            }
+
+        return stats
 
     def get_current_chat(self) -> Optional[str]:
         """获取当前聊天窗口"""

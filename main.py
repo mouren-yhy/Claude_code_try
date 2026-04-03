@@ -30,6 +30,7 @@ from storage.models import Contact
 from tray.icon import tray_app, set_exit_event
 from utils.logger import logger
 from web.app import flask_app
+from utils.async_helper import cleanup
 
 
 # 全局退出事件
@@ -215,6 +216,7 @@ def main(test_mode=False):
         if wechat_connected:
             wechat_client.stop_listening()
         tray_app.stop()
+        cleanup()  # 清理事件循环
         logger.info("服务已关闭")
 
 
